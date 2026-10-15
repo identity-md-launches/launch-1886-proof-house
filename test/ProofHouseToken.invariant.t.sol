@@ -18,7 +18,7 @@ contract TokenHandler is Test {
         expectedBalance[actors_[0]] = 1_000_000_000 ether;
     }
 
-    function transfer(uint256 fromSeed, uint256 toSeed, uint256 amount) external {
+    function transfer(uint256 fromSeed, uint256 toSeed, uint256 amount) public {
         address from = actors[fromSeed % actors.length];
         address to = actors[toSeed % actors.length];
         amount = bound(amount, 0, expectedBalance[from]);
@@ -28,7 +28,7 @@ contract TokenHandler is Test {
         expectedBalance[to] += amount;
     }
 
-    function approve(uint256 ownerSeed, uint256 spenderSeed, uint256 amount) external {
+    function approve(uint256 ownerSeed, uint256 spenderSeed, uint256 amount) public {
         address owner = actors[ownerSeed % actors.length];
         address spender = actors[spenderSeed % actors.length];
         vm.prank(owner);
@@ -36,7 +36,7 @@ contract TokenHandler is Test {
         expectedAllowance[owner][spender] = amount;
     }
 
-    function transferFrom(uint256 fromSeed, uint256 spenderSeed, uint256 toSeed, uint256 amount) external {
+    function transferFrom(uint256 fromSeed, uint256 spenderSeed, uint256 toSeed, uint256 amount) public {
         address from = actors[fromSeed % actors.length];
         address spender = actors[spenderSeed % actors.length];
         address to = actors[toSeed % actors.length];
@@ -62,8 +62,75 @@ contract TokenHandler is Test {
         );
         token.transfer(to, balance + 1);
     }
+
+    // Force boundaries as well as arbitrary amounts: uniform uint256 inputs rarely select
+    // an exact remaining balance or the sentinel for unlimited approval.
+    function transferBoundary(uint256 fromSeed, uint256 toSeed, uint256 edge) external {
+        uint256 balance = expectedBalance[actors[fromSeed % actors.length]];
+        transfer(fromSeed, toSeed, edge % 3 == 0 ? 0 : (edge % 3 == 1 && balance > 0 ? 1 : balance));
+    }
+
+    function approveBoundary(uint256 ownerSeed, uint256 spenderSeed, uint256 edge) external {
+        uint256[5] memory amounts = [uint256(0), 1, 1_000_000_000 ether, type(uint256).max - 1, type(uint256).max];
+        approve(ownerSeed, spenderSeed, amounts[edge % amounts.length]);
+    }
+
+    function transferFromBoundary(uint256 fromSeed, uint256 spenderSeed, uint256 toSeed) external {
+        address from = actors[fromSeed % actors.length];
+        address spender = actors[spenderSeed % actors.length];
+        uint256 maximum = expectedBalance[from];
+        if (expectedAllowance[from][spender] < maximum) maximum = expectedAllowance[from][spender];
+        transferFrom(fromSeed, spenderSeed, toSeed, maximum);
+    }
+
+    function insufficientAllowance(uint256 fromSeed, uint256 spenderSeed, uint256 toSeed, uint256 approved) external {
+        address from = actors[fromSeed % actors.length];
+        address spender = actors[spenderSeed % actors.length];
+        address to = actors[toSeed % actors.length];
+        approved = bound(approved, 0, 1_000_000_000 ether);
+        approve(fromSeed, spenderSeed, approved);
+        vm.prank(spender);
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, spender, approved, approved + 1)
+        );
+        token.transferFrom(from, to, approved + 1);
+        // The global model checks every balance and allowance after this rejected call.
+    }
+
+    function insufficientBalance(uint256 fromSeed, uint256 spenderSeed, uint256 toSeed, bool unlimited) external {
+        address from = actors[fromSeed % actors.length];
+        address spender = actors[spenderSeed % actors.length];
+        address to = actors[toSeed % actors.length];
+        uint256 balance = expectedBalance[from];
+        uint256 amount = balance + 1;
+        approve(fromSeed, spenderSeed, unlimited ? type(uint256).max : amount);
+        vm.prank(spender);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, from, balance, amount));
+        token.transferFrom(from, to, amount);
+        // In particular, a finite allowance spent before the balance check must be restored.
+    }
+
+    function invalidReceiver(uint256 fromSeed, uint256 spenderSeed, uint256 amount, bool unlimited) external {
+        address from = actors[fromSeed % actors.length];
+        address spender = actors[spenderSeed % actors.length];
+        amount = bound(amount, 0, expectedBalance[from]);
+        approve(fromSeed, spenderSeed, unlimited ? type(uint256).max : amount);
+        vm.prank(spender);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidReceiver.selector, address(0)));
+        token.transferFrom(from, address(0), amount);
+    }
+
+    function invalidSpender(uint256 ownerSeed, uint256 amount) external {
+        address owner = actors[ownerSeed % actors.length];
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidSpender.selector, address(0)));
+        token.approve(address(0), amount);
+    }
 }
 
+/// forge-config: default.invariant.runs = 256
+/// forge-config: default.invariant.depth = 128
+/// forge-config: default.invariant.fail-on-revert = true
 contract ProofHouseTokenInvariantTest is Test {
     ProofHouseToken internal token;
     TokenHandler internal handler;
@@ -75,11 +142,18 @@ contract ProofHouseTokenInvariantTest is Test {
         handler = new TokenHandler(token, actors);
         assertTrue(token.transfer(actors[0], 1_000_000_000 ether));
 
-        bytes4[] memory selectors = new bytes4[](4);
+        bytes4[] memory selectors = new bytes4[](11);
         selectors[0] = TokenHandler.transfer.selector;
         selectors[1] = TokenHandler.approve.selector;
         selectors[2] = TokenHandler.transferFrom.selector;
         selectors[3] = TokenHandler.overdraw.selector;
+        selectors[4] = TokenHandler.transferBoundary.selector;
+        selectors[5] = TokenHandler.approveBoundary.selector;
+        selectors[6] = TokenHandler.transferFromBoundary.selector;
+        selectors[7] = TokenHandler.insufficientAllowance.selector;
+        selectors[8] = TokenHandler.insufficientBalance.selector;
+        selectors[9] = TokenHandler.invalidReceiver.selector;
+        selectors[10] = TokenHandler.invalidSpender.selector;
         targetSelector(FuzzSelector({addr: address(handler), selectors: selectors}));
         targetContract(address(handler));
     }
@@ -90,6 +164,7 @@ contract ProofHouseTokenInvariantTest is Test {
             address account = actors[i];
             uint256 balance = token.balanceOf(account);
             assertEq(balance, handler.expectedBalance(account));
+            assertEq(token.allowance(account, address(0)), 0);
             sum += balance;
             for (uint256 j; j < actors.length; ++j) {
                 assertEq(token.allowance(account, actors[j]), handler.expectedAllowance(account, actors[j]));
