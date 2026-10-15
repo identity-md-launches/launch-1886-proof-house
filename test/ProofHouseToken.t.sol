@@ -23,6 +23,7 @@ contract RejectingRecipient {
     }
 }
 
+/// forge-config: default.fuzz.runs = 1000
 contract ProofHouseTokenTest is Test {
     uint256 internal constant SUPPLY = 1_000_000_000 ether;
     ProofHouseToken internal token;
@@ -243,6 +244,78 @@ contract ProofHouseTokenTest is Test {
         assertEq(token.balanceOf(bob), 6 ether);
     }
 
+    function testMaxMinusOneAllowanceIsFiniteAndCanReplaceUnlimitedApproval() public {
+        assertTrue(token.approve(spender, type(uint256).max));
+        assertTrue(token.approve(spender, type(uint256).max - 1));
+        vm.prank(spender);
+        assertTrue(token.transferFrom(address(this), alice, 1));
+        assertEq(token.allowance(address(this), spender), type(uint256).max - 2);
+        assertEq(token.balanceOf(alice), 1);
+        assertEq(token.balanceOf(address(this)), SUPPLY - 1);
+    }
+
+    function testOwnerUsingTransferFromStillNeedsAllowance() public {
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, address(this), 0, 1));
+        token.transferFrom(address(this), alice, 1);
+        assertEq(token.balanceOf(address(this)), SUPPLY);
+        assertEq(token.balanceOf(alice), 0);
+
+        assertTrue(token.approve(address(this), 1));
+        assertTrue(token.transferFrom(address(this), alice, 1));
+        assertEq(token.allowance(address(this), address(this)), 0);
+        assertEq(token.balanceOf(alice), 1);
+    }
+
+    function testIndependentSpendersCannotReuseExhaustedAllowance() public {
+        assertTrue(token.approve(spender, 3));
+        assertTrue(token.approve(bob, 5));
+        vm.prank(spender);
+        assertTrue(token.transferFrom(address(this), alice, 3));
+        assertEq(token.allowance(address(this), bob), 5);
+        vm.prank(spender);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InsufficientAllowance.selector, spender, 0, 1));
+        token.transferFrom(address(this), alice, 1);
+        vm.prank(bob);
+        assertTrue(token.transferFrom(address(this), alice, 5));
+        assertEq(token.allowance(address(this), spender), 0);
+        assertEq(token.allowance(address(this), bob), 0);
+        assertEq(token.balanceOf(alice), 8);
+        assertEq(token.balanceOf(address(this)), SUPPLY - 8);
+    }
+
+    function testDelegatedEntireSupplyRoundTripExhaustsAllowances() public {
+        assertTrue(token.approve(spender, SUPPLY));
+        vm.prank(spender);
+        assertTrue(token.transferFrom(address(this), alice, SUPPLY));
+        assertEq(token.balanceOf(address(this)), 0);
+        assertEq(token.balanceOf(alice), SUPPLY);
+        assertEq(token.allowance(address(this), spender), 0);
+
+        vm.prank(alice);
+        assertTrue(token.approve(spender, SUPPLY));
+        vm.prank(spender);
+        assertTrue(token.transferFrom(alice, address(this), SUPPLY));
+        assertEq(token.allowance(alice, spender), 0);
+        assertEq(token.balanceOf(alice), 0);
+        assertEq(token.balanceOf(address(this)), SUPPLY);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function testMaximumTransferFromWithUnlimitedApprovalRevertsWithoutChangingState() public {
+        assertTrue(token.approve(spender, type(uint256).max));
+        vm.prank(spender);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                IERC20Errors.ERC20InsufficientBalance.selector, address(this), SUPPLY, type(uint256).max
+            )
+        );
+        token.transferFrom(address(this), alice, type(uint256).max);
+        assertEq(token.allowance(address(this), spender), type(uint256).max);
+        assertEq(token.balanceOf(address(this)), SUPPLY);
+        assertEq(token.balanceOf(alice), 0);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
     function testSelfTransferFromConsumesAllowanceWithoutChangingBalance() public {
         assertTrue(token.approve(spender, 10 ether));
         vm.prank(spender);
@@ -426,8 +499,55 @@ contract ProofHouseTokenTest is Test {
         assertEq(token.balanceOf(alice), 0);
     }
 
+    function testFuzzFailedDelegatedSpendCanBeRetriedAfterFunding(uint256 funded, uint256 requested, uint256 approved)
+        public
+    {
+        funded = bound(funded, 0, SUPPLY - 1);
+        requested = bound(requested, funded + 1, SUPPLY);
+        approved = bound(approved, requested, type(uint256).max);
+        assertTrue(token.transfer(alice, funded));
+        vm.prank(alice);
+        assertTrue(token.approve(spender, approved));
+
+        vm.prank(spender);
+        vm.expectRevert(
+            abi.encodeWithSelector(IERC20Errors.ERC20InsufficientBalance.selector, alice, funded, requested)
+        );
+        token.transferFrom(alice, bob, requested);
+        assertEq(token.allowance(alice, spender), approved);
+        assertEq(token.balanceOf(alice), funded);
+        assertEq(token.balanceOf(bob), 0);
+        assertEq(token.balanceOf(address(this)), SUPPLY - funded);
+        assertEq(token.totalSupply(), SUPPLY);
+
+        // The rejected spend must leave the original approval usable, including when
+        // an empty account approved tokens before it ever received them.
+        assertTrue(token.transfer(alice, requested - funded));
+        vm.prank(spender);
+        assertTrue(token.transferFrom(alice, bob, requested));
+        assertEq(token.allowance(alice, spender), approved == type(uint256).max ? approved : approved - requested);
+        assertEq(token.balanceOf(alice), 0);
+        assertEq(token.balanceOf(bob), requested);
+        assertEq(token.balanceOf(address(this)), SUPPLY - requested);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
+    function testFuzzInvalidDelegatedRecipientRestoresAllowance(uint256 amount, uint256 approved) public {
+        amount = bound(amount, 0, SUPPLY);
+        approved = bound(approved, amount, type(uint256).max);
+        assertTrue(token.approve(spender, approved));
+        vm.prank(spender);
+        vm.expectRevert(abi.encodeWithSelector(IERC20Errors.ERC20InvalidReceiver.selector, address(0)));
+        token.transferFrom(address(this), address(0), amount);
+        assertEq(token.allowance(address(this), spender), approved);
+        assertEq(token.balanceOf(address(this)), SUPPLY);
+        assertEq(token.balanceOf(address(0)), 0);
+        assertEq(token.totalSupply(), SUPPLY);
+    }
+
     function testFuzzNonzeroRecipientsReceiveExactAmount(address recipient, uint256 amount) public {
-        vm.assume(recipient != address(0) && recipient != address(this));
+        // Map the two excluded recipients into the valid domain without discarding a run.
+        if (recipient == address(0) || recipient == address(this)) recipient = alice;
         amount = bound(amount, 0, SUPPLY);
         assertTrue(token.transfer(recipient, amount));
         assertEq(token.balanceOf(recipient), amount);
